@@ -1,6 +1,6 @@
 # Semi-Supervised Variational Autoencoder
 
-This repository contains code related to the paper [Semi-Supervised Variational Autoencoder for Survival Prediction](www.arxiv.org) TODO:Add paper link
+This repository contains code related to the paper [Semi-Supervised Variational Autoencoder for Survival Prediction](https://arxiv.org/abs/1910.04488)
 
 We have implemented a [semi-supervised variational autoencoder](https://arxiv.org/abs/1406.5298) for modeling of 3D brain images and classification.
 
