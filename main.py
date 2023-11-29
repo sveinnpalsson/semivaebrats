@@ -1,18 +1,21 @@
 import argparse
+from datetime import datetime as dt
 import os
+from os.path import join
 import pickle
 import sys
-from datetime import datetime as dt
-from os.path import join
+
 import nibabel as nib
 import numpy as np
 import torch
-import torch.nn.functional as f
+import torch.nn.functional as F
 import torchvision.utils as vutils
+import torchvision.transforms.functional as TF
 from tensorboardX import SummaryWriter
 from torch import optim
-from utils import pad_img, print_num_params, from_np, get_all_data, one_hot, check_args
+from tqdm import tqdm
 
+from utils import pad_img, print_num_params, from_np, get_data, one_hot, check_args, to_rgb, rotate_3d_batch
 from model import SemiVAE
 
 
@@ -29,380 +32,407 @@ tau_start = 1.0
 tau_end = 0.2
 tau_steps = 50000
 
-def main():
-    # set_rnd_seed(31)   # reproducibility
-
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--data_dir_train', type=str, default='./data/brats_19/Train', metavar='DATA_TRAIN', help="data train directory")
-    parser.add_argument('--data_dir_val', type=str, default='./data/brats_19/Validation', metavar='DATA_VAL', help="data validation directory")
-    parser.add_argument('--log_dir', type=str, default='logs/', metavar='LOGS', help="logs directory")
-    parser.add_argument('--models_dir', type=str, default='models/', metavar='MODELS',  help="models directory")
-    parser.add_argument('--batch_size', type=int, default=16, metavar='BATCH', help="batch size")
-    parser.add_argument('--learning_rate', type=float, default=2.0e-5, metavar='LR', help="learning rate")
-    parser.add_argument('--epochs', type=int, default=1e6, metavar='EPOCHS', help="number of epochs")
-    parser.add_argument('--zdim', type=int, default=16, metavar='ZDIM', help="Number of dimensions in latent space")
-    parser.add_argument('--load', type=str, default='', metavar='LOADDIR', help="time string of previous run to load from")
-    parser.add_argument('--binary_input', type=bool, default=False, metavar='BINARYINPUT', help="True=one input channel for each tumor structure")
-    parser.add_argument('--use_age', type=bool, default=False, metavar='AGE', help="use age in prediction")
-    parser.add_argument('--use_rs', type=bool, default=False, metavar='RESECTIONSTATUS', help="use resection status in prediction")
-
-    args = parser.parse_args()
+def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device in use: {}".format(device))
-    torch.set_default_tensor_type(torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor)
+    print("Device in use:", device)
 
-    logdir_suffix = '-%s-zdim=%d-beta=5000-alpha=%.5f-lr=%.5f-gamma=%d-batch=%d'%(args.data_dir_train.replace("Train","").replace(".","").replace("/",""),args.zdim,alpha,args.learning_rate,gamma,args.batch_size)
+    logdir_suffix = create_logdir_suffix(args)
+    args.models_dir = os.path.join(args.models_dir, logdir_suffix) if args.load == "" else join(args.models_dir, args.load)
+    args.log_dir = os.path.join(args.log_dir, logdir_suffix)
+    os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.models_dir, exist_ok=True)
+
+    writer = SummaryWriter(os.path.join(args.log_dir, 'train'))
+
+    # Load data, determine number of labels, and clinical data dimensions
+    data = get_data(args, orig_data_shape)
+
+    # Set up the SemiVAE model
+    model = setup_model(data['n_labels'], args.zdim, data['y_dim'], data['c_dim'], args.binary_input, device)
+
+    # Set up the optimizer
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
+
+    # Load checkpoint if a load path is provided
+    if args.load != "":
+        model, optimizer, start_epoch = load_model_checkpoint(args, model, optimizer)
+        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
+    else:
+        start_epoch = 0
+
+    # Run training loop
+    train(args, data, model, optimizer, scheduler, writer, start_epoch, device)
+
+def train(args, data, model, optimizer, scheduler, writer, start_epoch, device):
+    
+    total_steps = (len(data['x_u']) // args.batch_size) * (int(args.epochs) - int(start_epoch))
+    pbar = tqdm(total=total_steps, desc="Training Progress")
+
+    for epoch in range(int(start_epoch), int(args.epochs)):
+        model.train()
+        metrics_epoch = []
+        
+        for step in range(0, len(data['x_u']), args.batch_size):
+            # Prepare batch data
+            batch_data = prepare_batch_data(data, args.batch_size, device, aug_flip=args.aug_flip, aug_rotate=args.aug_rotate)
+
+            # Perform a single training step
+            loss, metrics, batch_data_for_logging = train_step(model, batch_data, optimizer, args.batch_size, data['n_labels'])
+            metrics_epoch.append(metrics)
+
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix_str(f"Epoch {epoch + 1}/{args.epochs}, Step {step // args.batch_size + 1}")
+
+            # Log training metrics at specified intervals
+            if model.global_step % args.log_interval == 0:
+                log_training_step(writer, metrics, model.global_step)
+
+            if model.global_step % args.log_image_interval == 0:
+                log_images(writer, model, batch_data_for_logging, model.global_step, args.log_dir, device, data['n_labels'])
+
+            # Validation at specified intervals
+            if model.global_step % args.validate_interval == 0:
+                validate_model(model, data, writer, device, args.batch_size, data['n_labels'])
+
+            # Save model checkpoint at specified intervals
+            if model.global_step % args.save_interval == 0:
+                save_model_checkpoint(model, optimizer, args.models_dir, epoch)
+
+            model.global_step += 1
+            scheduler.step()
+            
+        # Log epoch summary
+        log_epoch_summary(writer, metrics_epoch, model.global_step)
+
+    pbar.close()
+
+
+def prepare_batch_data(data, batch_size, device, aug_rotate=False, aug_flip=False):
+    x_u, x_l, y_l, c_l, c_u = data['x_u'], data['x_l'], data['y_l'], data['c_l'], data['c_u']
+
+    # Randomly sample indices for labeled and unlabeled data
+    batch_idx_l = np.random.choice(len(x_l), batch_size, replace=False)
+    batch_idx_u = np.random.choice(len(x_u), batch_size, replace=False)
+
+    # Extract batches for labeled and unlabeled data
+    batch_x_l = torch.tensor(x_l[batch_idx_l], dtype=torch.float32, device=device)
+    batch_x_u = torch.tensor(x_u[batch_idx_u], dtype=torch.float32, device=device)
+    batch_y_l = torch.tensor(y_l[batch_idx_l], dtype=torch.float32, device=device)
+
+    # Data augmentation
+    if aug_rotate:
+        angle = np.random.uniform(-25, 25)
+        axis = np.random.choice(['x', 'y', 'z'])
+        batch_x_l = rotate_3d_batch(batch_x_l, angle, axis)
+        batch_x_u = rotate_3d_batch(batch_x_u, angle, axis)
+
+    if aug_flip:
+        for axis in [2, 3, 4]:  # Axis 2, 3, 4 (spatial axes)
+            if np.random.rand() < 0.5:
+                batch_x_l = torch.flip(batch_x_l, dims=[axis])
+                batch_x_u = torch.flip(batch_x_u, dims=[axis])
+
+    # Extract batches for clinical data if available
+    batch_c_l = torch.tensor(c_l[batch_idx_l], dtype=torch.float32, device=device) if c_l.size > 0 else None
+    batch_c_u = torch.tensor(c_u[batch_idx_u], dtype=torch.float32, device=device) if c_u.size > 0 else None
+
+    return batch_x_l, batch_x_u, batch_y_l, batch_c_l, batch_c_u
+
+# def prepare_batch_data(data, batch_size, device):
+#     x_u, x_l, y_l, c_l, c_u = data['x_u'], data['x_l'], data['y_l'], data['c_l'], data['c_u']
+
+#     # Randomly sample indices for labeled and unlabeled data
+#     batch_idx_l = np.random.choice(len(x_l), batch_size, replace=False)
+#     batch_idx_u = np.random.choice(len(x_u), batch_size, replace=False)
+
+#     # Extract batches for labeled and unlabeled data
+#     batch_x_l = torch.tensor(x_l[batch_idx_l], dtype=torch.float32, device=device)
+#     batch_x_u = torch.tensor(x_u[batch_idx_u], dtype=torch.float32, device=device)
+#     batch_y_l = torch.tensor(y_l[batch_idx_l], dtype=torch.float32, device=device)
+
+#     # Extract batches for clinical data if available
+#     batch_c_l = torch.tensor(c_l[batch_idx_l], dtype=torch.float32, device=device) if c_l.size > 0 else None
+#     batch_c_u = torch.tensor(c_u[batch_idx_u], dtype=torch.float32, device=device) if c_u.size > 0 else None
+
+#     return batch_x_l, batch_x_u, batch_y_l, batch_c_l, batch_c_u
+
+def train_step(model, batch_data, optimizer, batch_size, n_labels):
+    batch_x_l, batch_x_u, batch_y_l, batch_c_l, batch_c_u = batch_data
+
+    # Zero the gradients before running the forward pass.
+    optimizer.zero_grad()
+
+    # Forward pass for labeled data
+    recon_batch_l, mu_l, logvar_l, logits_l = model(batch_x_l, batch_y_l, batch_c_l, tau=tau_schedule(model.global_step))
+
+    # Forward pass for unlabeled data
+    recon_batch_u, mu_u, logvar_u, logits_u = model(batch_x_u, [], batch_c_u, tau=tau_schedule(model.global_step))
+
+    # Compute losses
+    loss_l, bce_l, kl_l, classification, _ = compute_loss(recon_batch_l, batch_x_l, mu_l, logvar_l, logits_l, batch_y_l, batch_size, True, n_labels, model.global_step, model.binary_input)
+    loss_u, bce_u, kl_u, _, entropy = compute_loss(recon_batch_u, batch_x_u, mu_u, logvar_u, logits_u, None, batch_size, False, n_labels, model.global_step, model.binary_input)
+
+    # Total loss
+    total_loss = loss_l + loss_u
+
+    classifier_accuracy = calculate_accuracy(logits_l, batch_y_l)
+
+    metrics = {
+        'bce_l': bce_l, 'kl_l': kl_l, 'classification': classification,
+        'bce_u': bce_u, 'kl_u': kl_u, 'total_loss': total_loss, 'accuracy': classifier_accuracy,
+        'entropy': entropy
+    }
+
+    # Backward pass and optimization
+    total_loss.backward()
+    optimizer.step()
+
+    batch_data_for_logging = {}
+    batch_data_for_logging['batch_u'] = batch_x_u
+    batch_data_for_logging['recon_u'] = recon_batch_u
+    batch_data_for_logging['logits_u'] = logits_u
+    batch_data_for_logging['c_l'] = batch_c_l
+
+    return total_loss.item(), metrics, batch_data_for_logging
+
+def compute_loss(recon_batch, batch, mu, logvar, logits, labels, batch_size, is_labeled, n_labels, global_step, binary_input):
+    # Binary cross-entropy or cross-entropy loss for reconstruction
+    if n_labels <= 2:
+        bce = F.binary_cross_entropy(recon_batch, batch, reduction='sum') / batch_size
+    else:
+        target_labels = torch.max(batch, 1)[1] if binary_input else batch[:,0]
+        bce = F.cross_entropy(recon_batch, target_labels.type(torch.int64), reduction='sum') / batch_size
+
+    # KL divergence loss
+    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
+
+    # Classification loss and entropy calculation
+    classification = 0
+    entropy = 0
+    if is_labeled:
+        classification = F.cross_entropy(logits, torch.argmax(labels, dim=1), reduction='sum') / batch_size
+    else:
+        softmax_u = torch.softmax(logits, dim=-1)
+        entropy = -torch.sum(torch.mul(softmax_u, torch.log(softmax_u + 1e-12)), dim=-1).mean()
+
+    # Combine losses
+    loss = (bce + kl * beta_schedule(global_step)) / 2
+    if is_labeled:
+        loss += classification * alpha / 2
+    else:
+        loss += -entropy * gamma
+
+    return loss, bce, kl, classification, entropy
+
+def validate_model(model, data, writer, device, batch_size, n_labels):
+    model.eval()  # Set the model to evaluation mode
+    val_loss_accum = 0.0
+    val_accuracy_accum = 0.0
+    val_steps = 0
+    x_v, y_v, c_v = data['x_v'], data['y_v'], data['c_v']
+
+    with torch.no_grad():  # No gradients needed for validation
+        for i in range(0, len(x_v), args.batch_size):
+            # Prepare the validation batch
+            batch_x_v = torch.tensor(x_v[i:i + args.batch_size], dtype=torch.float32, device=device)
+            batch_y_v = torch.tensor(y_v[i:i + args.batch_size], dtype=torch.float32, device=device)
+            batch_c_v = torch.tensor(c_v[i:i + args.batch_size], dtype=torch.float32, device=device) if c_v.size > 0 else None
+
+            # Forward pass
+            recon_batch_v, mu_v, logvar_v, logits_v = model(batch_x_v, batch_y_v, batch_c_v, tau=0.0)
+
+            # Compute loss and accuracy
+            val_loss, _, _, _, _ = compute_loss(recon_batch_v, batch_x_v, mu_v, logvar_v, logits_v, batch_y_v, batch_size, True, n_labels, model.global_step, model.binary_input)
+            val_loss_accum += val_loss.item()
+
+            val_accuracy = calculate_accuracy(logits_v, batch_y_v)
+            val_accuracy_accum += val_accuracy
+
+            val_steps += 1
+
+    # Calculate average validation loss and accuracy
+    avg_val_loss = val_loss_accum / val_steps
+    avg_val_accuracy = val_accuracy_accum / val_steps
+
+    # Log validation results
+    writer.add_scalar('validation_loss', avg_val_loss, model.global_step)
+    writer.add_scalar('validation_accuracy', avg_val_accuracy, model.global_step)
+
+    model.train()  # Set the model back to training mode
+
+def calculate_accuracy(logits, labels):
+    predicted = torch.argmax(logits, dim=1)
+    correct = (predicted == torch.argmax(labels, dim=1)).sum().item()
+    accuracy = correct / logits.size(0)
+    return accuracy
+
+def log_training_step(writer, metrics, global_step):
+    writer.add_scalar('loss/total', metrics['total_loss'], global_step)
+    writer.add_scalar('loss/bce_l', metrics['bce_l'], global_step)
+    writer.add_scalar('loss/kl_l', metrics['kl_l'], global_step)
+    writer.add_scalar('loss/classification', metrics['classification'], global_step)
+    writer.add_scalar('loss/bce_u', metrics['bce_u'], global_step)
+    writer.add_scalar('loss/kl_u', metrics['kl_u'], global_step)
+    writer.add_scalar('metrics/accuracy', metrics['accuracy'], global_step)
+    writer.add_scalar('metrics/categorical_entropy', metrics['entropy'], global_step)
+
+def log_epoch_summary(writer, metrics_epoch, global_step):
+    # Initialize accumulators for each metric
+    total_loss = bce_l = kl_l = classification = bce_u = kl_u = accuracy = h = 0
+
+    # Aggregate metrics across all steps in the epoch
+    for metrics in metrics_epoch:
+        total_loss += metrics['total_loss']
+        bce_l += metrics['bce_l']
+        kl_l += metrics['kl_l']
+        classification += metrics['classification']
+        bce_u += metrics['bce_u']
+        kl_u += metrics['kl_u']
+        accuracy += metrics['accuracy']
+        h += metrics['entropy']
+
+    num_steps = len(metrics_epoch)
+
+    # Calculate averages and log them
+    writer.add_scalar('epoch_loss/average_total', total_loss / num_steps, global_step)
+    writer.add_scalar('epoch_loss/average_bce_l', bce_l / num_steps, global_step)
+    writer.add_scalar('epoch_loss/average_kl_l', kl_l / num_steps, global_step)
+    writer.add_scalar('epoch_loss/average_classification', classification / num_steps, global_step)
+    writer.add_scalar('epoch_loss/average_bce_u', bce_u / num_steps, global_step)
+    writer.add_scalar('epoch_loss/average_kl_u', kl_u / num_steps, global_step)
+    writer.add_scalar('epoch_metrics/average_accuracy', accuracy / num_steps, global_step)
+    writer.add_scalar('epoch_metrics/average_categorical_entropy', h / num_steps, global_step)
+
+def log_images(writer, model, data, global_step, logdir, device, n_labels):
+    
+    # Classifier output on unlabeled batch
+    softmax_u = torch.softmax(data['logits_u'], dim=-1)
+    softmax_image = vutils.make_grid(softmax_u.permute(1, 0).detach())
+    writer.add_image('classifier_output', softmax_image, global_step)
+
+    # Prepare images for input and reconstruction comparison
+    imgs = prepare_comparison_images(data['batch_u'], data['recon_u'], model.n_labels, model.binary_input)
+    imgs = vutils.make_grid(imgs, nrow=2)
+    comparison_image = to_rgb(imgs[0]) if n_labels > 2 else imgs
+
+    writer.add_image('images/input_and_recons', comparison_image, global_step)
+
+    # Generate and log samples
+    generated_imgs, samples = generate_model_samples(model, data['c_l'], device, n_labels)
+    writer.add_image('generated', generated_imgs, global_step)
+    save_generated_samples(samples, model.y_dim, logdir, global_step)
+
+def get_slice_with_max_nonzero(image, axis=2):
+    """
+    Finds the index of the slice along the specified axis with the most nonzero content.
+
+    Args:
+    image (Tensor): The input image tensor.
+    axis (int): The axis along which to find the slice. Defaults to 2 (depth).
+
+    Returns:
+    int: The index of the slice with the most nonzero content.
+    """
+    # Determine the dimensions to sum over
+    # We sum over all dimensions except the specified axis and the batch dimension
+    sum_dims = [i for i in range(len(image.shape)) if i not in [0, axis]]
+
+    # Count the number of nonzero elements in each slice along the specified axis
+    nonzero_counts = (image != 0).sum(dim=tuple(sum_dims))
+
+    # Find the index of the slice with the maximum count
+    max_index = nonzero_counts.argmax()
+    return max_index.item()  # return as a Python int for indexing
+
+def prepare_comparison_images(batch_u_, recon_batch_u, n_labels, binary_input):
+    # Logic to prepare comparison images (input and reconstructed)
+    targ_size = 94
+    recon_batch_u = torch.argmax(recon_batch_u, dim=1)
+    batch_u_ = torch.argmax(batch_u_, dim=1).unsqueeze(1) if binary_input else batch_u_.type(torch.int64)
+    recon_batch_u = recon_batch_u.unsqueeze(1)
+
+    imgs = []
+
+    for i in range(min(len(batch_u_), 3)):  # Adjust the number of slices if needed
+        index = get_slice_with_max_nonzero(batch_u_[i:i+1], axis=2)
+        imgs.append(pad_img(batch_u_[i:i+1, :, index, :, :], targ_size))
+        imgs.append(pad_img(recon_batch_u[i:i+1, :, index, :, :], targ_size))
+
+    return torch.cat(imgs, dim=0).detach()
+
+def generate_model_samples(model, c_l, device, n_labels):
+    targ_size = 94
+    with torch.no_grad():
+        z = model.sample_prior(n_samples=model.y_dim).to(device)
+        y = torch.eye(model.y_dim).to(device)
+        sample_reconstruction = model.decoder(z, y, c_l[0:model.y_dim]) if (c_l is not None and c_l.shape[0] != 0) else model.decoder(z, y, None)
+        sample_reconstruction = torch.argmax(sample_reconstruction, dim=1).unsqueeze(1)
+        imgs = []
+        index = get_slice_with_max_nonzero(sample_reconstruction[0], 1)
+        imgs.append(pad_img(sample_reconstruction[0:1, :, index, :, :], targ_size))
+        index = get_slice_with_max_nonzero(sample_reconstruction[0], 2)
+        imgs.append(pad_img(sample_reconstruction[0:1, :, :, index, :], targ_size))
+        index = get_slice_with_max_nonzero(sample_reconstruction[0], 3)
+        imgs.append(pad_img(sample_reconstruction[0:1, :, :, :, index], targ_size))
+        imgs = torch.cat(imgs, dim=0).detach()
+        imgs = vutils.make_grid(imgs, nrow=3)
+        if n_labels>2:
+            imgs = to_rgb(imgs[0])
+
+        return imgs, sample_reconstruction.cpu().data.numpy()
+
+def save_generated_samples(samples, y_dim, logdir, global_step):
+    for class_label in range(y_dim):
+        img = nib.Nifti1Image(samples[class_label, 0].astype(np.int8), np.eye(4))
+        nib.save(img, os.path.join(logdir, f"generated_class_{class_label}_step_{global_step}.nii.gz"))
+
+def save_model_checkpoint(model, optimizer, models_dir, epoch):
+    checkpoint_path = os.path.join(models_dir, f'model_checkpoint_{epoch}.pt')
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'global_step': model.global_step
+    }, checkpoint_path)
+    print(f'Checkpoint saved at {checkpoint_path}')
+
+def load_model_checkpoint(args, model, optimizer):
+    print("Loading model from %s" % args.models_dir)
+    nums = [int(i.split("_")[-1].replace('.pt', '')) for i in os.listdir(args.models_dir)]
+    start_epoch = max(nums)
+    model_path = join(args.models_dir, f"model_checkpoint_{start_epoch}.pt")
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch']
+    model.global_step = checkpoint['global_step']
+    print("Loaded model at epoch %d, total steps: %d" % (start_epoch, model.global_step))
+    return model, optimizer, start_epoch
+
+def setup_model(n_labels, z_dim, y_dim, c_dim, binary_input, device):
+    model = SemiVAE(z_dim, y_dim, c_dim, n_labels=n_labels, binary_input=binary_input).to(device)
+    print_num_params(model)
+    return model
+
+def create_logdir_suffix(args):
+    logdir_suffix = '-{}-zdim={}-beta=5000-alpha={:.5f}-lr={:.5f}-gamma={}-batch={}'.format(
+        args.data_dir_train.replace("Train", "").replace(".", "").replace("/", ""),
+        args.zdim, alpha, args.learning_rate, gamma, args.batch_size
+    )
     if args.use_age:
         logdir_suffix += "-age"
     if args.use_rs:
         logdir_suffix += "-rs"
+    if args.use_mgmt:
+        logdir_suffix += "-mgmt"
     if args.binary_input:
         logdir_suffix += "-binary_input"
-    if args.load == "":
-        date_str = str(dt.now())[:-7].replace(":", "-").replace(" ", "-") + logdir_suffix
-    else:
-        date_str = args.load
-    args.models_dir = join(args.models_dir, date_str)
-    args.log_dir = join(args.log_dir, date_str)
-    os.makedirs(args.log_dir, exist_ok=True)
-    os.makedirs(args.models_dir, exist_ok=True)
-    check_args(args)
-    writer = SummaryWriter(args.log_dir + '-train')
 
-    ## Get dataset
+    return str(dt.now())[:-7].replace(":", "-").replace(" ", "-") + logdir_suffix
 
-    data = get_all_data(args.data_dir_train, args.data_dir_val, orig_data_shape,binary_input=args.binary_input)
-
-    x_data_train_labeled, x_data_train_unlabeled, x_data_val, y_data_train_labeled, y_data_val, y_dim = data
-    if args.binary_input:
-        n_labels = x_data_train_labeled.shape[1]
-    else:
-        n_labels = len(np.bincount(x_data_train_labeled[:10].astype(np.int8).flatten()))
-    x_data_train_labeled = x_data_train_labeled.astype(np.int8)
-    x_data_train_unlabeled = x_data_train_unlabeled.astype(np.int8)
-    x_data_val = x_data_val.astype(np.int8)
-
-    if args.use_age:
-        age_std = 12.36
-        age_mean = 62.2
-        age_l = np.expand_dims(np.load(join(args.data_dir_train,"age_l.npy")),1)
-        age_u = np.expand_dims(np.load(join(args.data_dir_train,"age_u.npy")),1)
-        age_v = np.expand_dims(np.load(join(args.data_dir_val,"age.npy")),1)
-        age_l = (age_l-age_mean)/age_std
-        age_u = (age_u-age_mean)/age_std
-        age_v = (age_v-age_mean)/age_std
-    else:
-        age_l, age_u, age_v = [],[],[]
-
-    if args.use_rs:
-        rs_l = one_hot(np.load(join(args.data_dir_train,"rs_l.npy")),2)
-        rs_u = one_hot(np.load(join(args.data_dir_train,"rs_u.npy")),2)
-        rs_v = one_hot(np.load(join(args.data_dir_val,"rs.npy")),2)
-    else:
-        rs_l, rs_u, rs_v = [],[],[]
-
-    if args.use_rs and args.use_age:
-        c_l = np.concatenate([age_l,rs_l],axis=1)
-        c_u = np.concatenate([age_u,rs_u],axis=1)
-        c_v = np.concatenate([age_v,rs_v],axis=1)
-        c_dim = c_l.shape[1]
-    elif args.use_rs:
-        c_l,c_u,c_v = rs_l,rs_u,rs_v
-        c_dim = c_l.shape[1]
-    elif args.use_age:
-        c_l,c_u,c_v = age_l,age_u,age_v
-        c_dim = c_l.shape[1]
-    else:
-        c_l,c_u,c_v = np.array([]),np.array([]),np.array([])
-        c_dim = 0
-
-    y_data_val = y_data_val[:len(x_data_val)]
-    print('x unlabeled data shape:', x_data_train_unlabeled.shape)
-    print('x labeled data shape:', x_data_train_labeled.shape)
-    print('x val data shape:', x_data_val.shape)
-    assert data_shape == tuple(x_data_val.shape[2:])
-    print('input labels: %d'%n_labels)
-
-    model = SemiVAE(args.zdim, y_dim, c_dim,n_labels=n_labels,binary_input=args.binary_input).to(device)
-    print_num_params(model)
-    
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    start_epoch = 0
-
-    if args.load != "":
-        print("Loading model from %s" % args.models_dir)
-        nums = [int(i.split("_")[-1]) for i in os.listdir(args.models_dir)]
-        start_epoch = max(nums)
-        model_path = join(args.models_dir, "model_epoch_%d" % start_epoch)
-        checkpoint = torch.load(model_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'model_global_step' in checkpoint.keys():
-            model.global_step = checkpoint['model_global_step']
-        start_epoch = checkpoint['epoch']
-        print("Loaded model at epoch %d, total steps: %d" % (start_epoch, model.global_step))
-
-    t_start = dt.now()
-    for epoch in range(int(start_epoch+1), int(args.epochs)):
-        train(x_data_train_unlabeled, x_data_train_labeled, y_data_train_labeled,
-              x_data_val, y_data_val, c_l, c_u, c_v, args.batch_size, epoch, model, optimizer, device, log_interval, writer, args.log_dir,n_labels)
-        if (dt.now() - t_start).total_seconds() > 3600*2:
-            torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'model_global_step': model.global_step,
-                    }, join(args.models_dir, "model_epoch_%d" % epoch))
-            t_start = dt.now()
-        sys.stdout.flush()   # need this when redirecting to file
-
-
-def train(x_u, x_l, y_l, x_v, y_v, c_l, c_u, c_v, batch_size, epoch, model, optimizer, device, log_interv, writer, logdir,n_labels):
-    model.train()
-    loss_accum = []   # accumulate one epoch
-    kl_accum = []
-    classification_accum = []
-    recons_accum = []
-    h_accum = []
-    accuracy_accum = []
-    L_accum = []
-    U_accum = []
-    for train_step in range(len(x_u)//batch_size):
-        optimizer.zero_grad()
-        batch_idx_l = np.random.choice(len(x_l), batch_size, replace=False)
-        batch_l = np.float32(x_l[batch_idx_l])
-        batch_idx_u = np.random.choice(len(x_u), batch_size, replace=False)
-        batch_u = np.float32(x_u[batch_idx_u])
-        batch_labels = np.float32(y_l[batch_idx_l])
-        
-        if c_l.shape[0]!=0:
-            batch_c_l = from_np(np.float32(c_l[batch_idx_l]),device=device)
-            batch_c_u = from_np(np.float32(c_u[batch_idx_u]),device=device)
-        else:
-            batch_c_l = None
-            batch_c_u = None
-            
-        batch_u, batch_l, batch_labels = from_np(batch_u, batch_l, batch_labels, device=device)
-        
-        ## Forward
-        recon_batch_u, mu_u, logvar_u, logits_u = model(batch_u, [], batch_c_u, tau=tau_schedule(model.global_step))
-        recon_batch_l, mu_l, logvar_l, logits_l = model(batch_l, batch_labels, batch_c_l, tau=tau_schedule(model.global_step))
-
-        ## Losses (normalized by minibatch size)
-        if n_labels<=2:
-            bce_l = f.binary_cross_entropy(recon_batch_l, batch_l, reduction='sum') / batch_size
-        else:
-            if model.binary_input:
-                bce_l = f.cross_entropy(recon_batch_l, torch.max(batch_l,1)[1].type(torch.int64), reduction='sum') / batch_size
-            else:
-                bce_l = f.cross_entropy(recon_batch_l, batch_l[:,0].type(torch.int64), reduction='sum') / batch_size
-
-        kl_l = -0.5 * torch.sum(1 + logvar_l - mu_l.pow(2) - logvar_l.exp()) / batch_size
-        loss_l = (bce_l + kl_l * beta_schedule(model.global_step)) / 2   # we're actually using 2 batches
-        L_accum.append(loss_l.item())
-        classification = f.cross_entropy(logits_l, torch.argmax(batch_labels, dim=1), reduction='sum') / batch_size
-        loss_l += classification * alpha / 2    # in the overall loss it weighs half
-        # TODO log p(y) is missing both here and in unlabeled (it's constant but we need it to report ELBO)
-
-        accuracy = float(torch.sum(torch.max(logits_l, 1)[1].type(torch.cuda.FloatTensor) ==
-                         torch.max(batch_labels, 1)[1].type(torch.cuda.FloatTensor))) / batch_size
-
-        if n_labels<=2:
-            bce_u = f.binary_cross_entropy(recon_batch_u, batch_u, reduction='sum') / batch_size
-        else:
-            if model.binary_input:
-                bce_u = f.cross_entropy(recon_batch_u,torch.max(batch_u,1)[1].type(torch.int64), reduction='sum') / batch_size
-            else:
-                bce_u = f.cross_entropy(recon_batch_u, batch_u[:,0].type(torch.int64), reduction='sum') / batch_size
-
-        kl_u = -0.5 * torch.sum(1 + logvar_u - mu_u.pow(2) - logvar_u.exp()) / batch_size
-        loss_u = (bce_u + kl_u * beta_schedule(model.global_step)) / 2   # we're actually using 2 batches
-        softmax_u = torch.softmax(logits_u, dim=-1)
-        h = -torch.sum(torch.mul(softmax_u, torch.log(softmax_u + 1e-12)), dim=-1).mean()
-        loss_u += -h * gamma
-
-        U_accum.append(loss_u.item())
-        loss = loss_l + loss_u
-        loss_accum.append(loss.item())
-        kl_accum.append(kl_l.item() + kl_u.item())
-        classification_accum.append(classification.item())
-        accuracy_accum.append(accuracy)
-        h_accum.append(h.item())
-        recons_accum.append((bce_l.item() + bce_u.item()) / 2)
-
-        ## Backward: accumulate gradients
-        loss.backward()
-
-        ## Clip gradients
-        for param in model.parameters():
-            if param.grad is not None:
-                torch.nn.utils.clip_grad_norm_(param, grad_norm_clip)
-
-        optimizer.step()
-        model.global_step += 1
-
-        ## Training step finished -- now write to tensorboard
-        if model.global_step % log_interv == 0:
-            ## Get losses over last step
-            loss_step = loss_accum[-1]
-            recons_step = np.mean(recons_accum[-1])
-            kl_step = np.mean(kl_accum[-1])
-            L_step = np.mean(L_accum[-1])
-            U_step = np.mean(U_accum[-1])
-            class_step = classification_accum[-1]
-            accuracy_step = accuracy_accum[-1]
-            h_step = h_accum[-1]
-            print("epoch {}, step {} - loss: {:.4g} \trecons: {:.4g} \tKL: {:.4g} \tclass: {:.4g} \taccuracy: {:.4g} \tcategorical entropy: {:.4g}".format(
-                    epoch, model.global_step, loss_step, recons_step, kl_step, class_step, accuracy_step, h_step))
-
-            ## Save losses
-            writer.add_scalar('losses/loss', loss_step, model.global_step)
-            writer.add_scalar('losses/recons', recons_step, model.global_step)
-            writer.add_scalar('losses/KL', kl_step, model.global_step)
-            writer.add_scalar('losses/class', class_step, model.global_step)
-            writer.add_scalar('losses/accuracy', accuracy_step, model.global_step)
-            writer.add_scalar('losses/L', L_step, model.global_step)
-            writer.add_scalar('losses/U', U_step, model.global_step)
-
-        
-        ## Validation set
-        if model.global_step % (log_interv * 2) == 2:
-            kl_accum_val = []
-            classification_accum_val = []
-            recons_accum_val = []
-            accuracy_accum_val = []
-            model.eval()
-            for val_step in range(len(x_v)//batch_size):
-                batch_idx = np.random.choice(len(x_v), batch_size, replace=False)
-                data_val = np.float32(x_v[batch_idx])
-                labels_val = np.float32(y_v[batch_idx])
-                
-                if c_v.shape[0]!=0:
-                    c_val = from_np(np.float32(c_v[batch_idx]),device=device)
-                else:
-                    c_val = None
-                data_val, labels_val = from_np(data_val, labels_val, device=device)
-                recon_batch_val, mu_val, logvar_val, logits_val = model(data_val, labels_val, c_val)
-
-                if n_labels<=2:
-                    bce_val = f.binary_cross_entropy(recon_batch_val, data_val, reduction='sum') / batch_size
-                else:
-                    if model.binary_input:                        
-                        bce_val = f.cross_entropy(recon_batch_val, torch.max(data_val,1)[1].type(torch.int64), reduction='sum') / batch_size
-                    else:
-                        bce_val = f.cross_entropy(recon_batch_val, data_val[:,0].type(torch.int64), reduction='sum') / batch_size
-                kl_val = -0.5 * torch.sum(1 + logvar_val - mu_val.pow(2) - logvar_val.exp()) / batch_size
-                classification_val = f.cross_entropy(logits_val, torch.argmax(labels_val, dim=1), reduction='sum') / batch_size
-                accuracy_val = float(torch.sum(torch.max(logits_val[:batch_size], 1)[1].type(torch.cuda.FloatTensor) ==
-                                     torch.max(labels_val, 1)[1].type(torch.cuda.FloatTensor))) / batch_size
-                kl_accum_val.append(kl_val.item())
-                recons_accum_val.append(bce_val.item())
-                classification_accum_val.append(classification_val.item())
-                accuracy_accum_val.append(accuracy_val)
-            model.train()
-
-            ## Log validation stuff
-            recons_val_mean = np.mean(recons_accum_val)
-            kl_val_mean = np.mean(kl_accum_val)
-            class_val_mean = np.mean(classification_accum_val)
-            accuracy_val_mean = np.mean(accuracy_accum_val)
-
-            print("Validation:  rec {:.4g}  KL {:.4g}  clf {:.4g}  acc {:.4g}".format(
-                  recons_val_mean, kl_val_mean, class_val_mean, accuracy_val_mean))
-
-            writer.add_scalar('val losses/recons', recons_val_mean, model.global_step)
-            writer.add_scalar('val losses/KL', kl_val_mean, model.global_step)
-            writer.add_scalar('val losses/class', class_val_mean, model.global_step)
-            writer.add_scalar('val losses/accuracy', accuracy_val_mean, model.global_step)
-
-
-        if model.global_step % 500 == 0:
-
-            ## Classifier output on unlabeled
-            softmax_image = vutils.make_grid(softmax_u.permute(1, 0).detach())
-            writer.add_image('classifier output', softmax_image, model.global_step)
-            ## Save imgs
-            imgs = []
-            targ_size = 94
-            recon_batch_u = torch.argmax(recon_batch_u,dim=1)
-            if model.binary_input:
-                batch_u_ = torch.argmax(batch_u,dim=1).type(torch.int64).unsqueeze(1)
-            else:
-                batch_u_ = batch_u.type(torch.int64)
-            recon_batch_u = recon_batch_u.type(torch.int64).unsqueeze(1)
-            index = np.random.randint(25, batch_u_.shape[2] - 25)
-            imgs.append(pad_img(batch_u_[0:1, :, index, :, :], targ_size))
-            imgs.append(pad_img(recon_batch_u[0:1, :, index, :, :], targ_size))
-            index = np.random.randint(25, batch_u_.shape[3] - 25)
-            imgs.append(pad_img(batch_u_[0:1, :, :, index, :], targ_size))
-            imgs.append(pad_img(recon_batch_u[0:1, :, :, index, :], targ_size))
-            index = np.random.randint(25, batch_u_.shape[4] - 25)
-            imgs.append(pad_img(batch_u_[0:1, :, :, :, index], targ_size))
-            imgs.append(pad_img(recon_batch_u[0:1, :, :, :, index], targ_size))
-            #  - Concatenate and make into grid so they are displayed next to each other
-            imgs = torch.cat(imgs, dim=0).detach()
-            imgs = vutils.make_grid(imgs, nrow=2)
-            if n_labels>2:
-                imgs = to_rgb(imgs[0])
-            #  - Save
-            writer.add_image('images/input and recons', imgs, model.global_step)
-
-            ## Generate samples
-            #  - Sample
-            with torch.no_grad():
-                z = model.sample_prior(n_samples=model.y_dim)
-                y = torch.arange(0, torch.tensor(model.y_dim))
-                y_out = torch.zeros(model.y_dim, model.y_dim)
-                y_out[torch.arange(y_out.shape[0]), y] = 1
-                y = y_out
-                if c_l.shape[0]!=0:
-                    sample_reconstruction = model.decoder(z, y, batch_c_l[0:model.y_dim])
-                else:
-                    sample_reconstruction = model.decoder(z, y, None)
-
-            #  - One slice per dimension, for all samples
-            imgs = []
-            sample_reconstruction = torch.argmax(sample_reconstruction,dim=1).unsqueeze(1)
-            index = np.random.randint(25, batch_u_.shape[2] - 25)
-            imgs.append(pad_img(sample_reconstruction[:, :, index, :, :], targ_size))
-            index = np.random.randint(25, batch_u_.shape[3] - 25)
-            imgs.append(pad_img(sample_reconstruction[:, :, :, index, :], targ_size))
-            index = np.random.randint(25, batch_u_.shape[4] - 25)
-            imgs.append(pad_img(sample_reconstruction[:, :, :, :, index], targ_size))
-            #  - Concatenate and make into grid so they are displayed next to each other
-            imgs = torch.cat(imgs, dim=0).detach()
-            imgs = vutils.make_grid(imgs, nrow=3)
-            if n_labels>2:
-                imgs = to_rgb(imgs[0])
-            #  - Save
-            writer.add_image('generated', imgs, model.global_step)
-            samples = sample_reconstruction.cpu().data.numpy()
-            for class_label in range(model.y_dim):
-                img = nib.Nifti1Image(samples[class_label, 0].astype(np.int8), np.eye(4))
-                nib.save(img, join(logdir, "generated_class_%d_step_%d.nii.gz" % (class_label, model.global_step)))
-                
-
-    ## Save losses, avg over epoch
-    writer.add_scalar('epoch losses/loss', np.mean(loss_accum), model.global_step)
-    writer.add_scalar('epoch losses/recons', np.mean(recons_accum), model.global_step)
-    writer.add_scalar('epoch losses/KL', np.mean(kl_accum), model.global_step)
-    writer.add_scalar('epoch losses/classification', np.mean(classification_accum), model.global_step)
-    writer.add_scalar('epoch losses/accuracy', np.mean(accuracy_accum), model.global_step)
-    writer.add_scalar('epoch losses/categ_entropy', np.mean(h_accum), model.global_step)
-
-def to_rgb(im):
-    if len(im.shape)==4:
-        im=im[0]
-    if len(im.shape)==2:
-        new_shape = [3]+list(im.shape)
-    else:
-        new_shape = list(im.shape)
-        new_shape[0] = 3
-    rgb_im = torch.zeros(new_shape)
-    rgb_im[0] = im==1
-    rgb_im[1] = im==2
-    rgb_im[2] = im==3
-    return rgb_im
 
 def beta_schedule(step):
     return min(step / 6, 5000.0)   # reach 5000 at iteration 30k
@@ -414,4 +444,28 @@ def tau_schedule(step):
     return max(tau, tau_end)
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--data_dir', type=str, default='data/brats_20_semivae_dataset', metavar='DATADIR', help="data directory, created with the create_dataset script")    
+    parser.add_argument('--log_dir', type=str, default='logs/', metavar='LOGS', help="logs directory")
+    parser.add_argument('--models_dir', type=str, default='models/', metavar='MODELS',  help="models directory")
+    parser.add_argument('--batch_size', type=int, default=16, metavar='BATCH', help="batch size")
+    parser.add_argument('--learning_rate', type=float, default=2.0e-5, metavar='LR', help="learning rate")
+    parser.add_argument('--epochs', type=int, default=20000, metavar='EPOCHS', help="number of epochs")
+    parser.add_argument('--zdim', type=int, default=16, metavar='ZDIM', help="Number of dimensions in latent space")
+    parser.add_argument('--log_interval', type=int, default=10, metavar='LOGINT', help="Training steps between logging")
+    parser.add_argument('--log_image_interval', type=int, default=500, metavar='LOGIMAGEINT', help="Training steps between logging images")
+    parser.add_argument('--validate_interval', type=int, default=20, metavar='VALINT', help="Training steps between model validation")
+    parser.add_argument('--save_interval', type=int, default=2000, metavar='SAVEINT', help="Training steps between model validation")
+    parser.add_argument('--load', type=str, default='', metavar='LOADDIR', help="time string of previous run to load from")
+    parser.add_argument('--binary_input', action='store_true', help="Set this flag to use one input channel for each tumor structure")
+    parser.add_argument('--use_age', action='store_true', help="Set this flag to use age in prediction")
+    parser.add_argument('--use_rs', action='store_true', help="Set this flag to use resection status in prediction")
+    parser.add_argument('--use_mgmt', action='store_true', help="Set this flag to use MGMT value in prediction")
+    parser.add_argument('--aug_rotate', action='store_true', help="Set this flag to use rotation augmentation")
+    parser.add_argument('--aug_flip', action='store_true', help="Set this flag to use flip augmentation")
+
+    args = parser.parse_args()
+    args.data_dir_train = join(args.data_dir, 'Train')
+    args.data_dir_val = join(args.data_dir, 'Validation')
+    args.data_info_path = join(args.data_dir, 'info_table.csv')
+    main(args)
